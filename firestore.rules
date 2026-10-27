@@ -1,0 +1,272 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function membershipPath(orgId) {
+      return /databases/$(database)/documents/users/$(request.auth.uid)/memberships/$(orgId);
+    }
+    function isMember(orgId) {
+      return signedIn() && exists(membershipPath(orgId)) && get(membershipPath(orgId)).data.active == true;
+    }
+    function memberRole(orgId) {
+      return get(membershipPath(orgId)).data.role;
+    }
+    function hasRole(orgId, allowed) {
+      return isMember(orgId) && memberRole(orgId) in allowed;
+    }
+    function isManager(orgId) { return hasRole(orgId, ['admin', 'supervisor']); }
+    function isAdmin(orgId) { return hasRole(orgId, ['admin']); }
+    function memberWorkerId(orgId) {
+      return get(membershipPath(orgId)).data.workerId;
+    }
+    function ownsWorker(orgId, workerId) {
+      return isMember(orgId) && memberWorkerId(orgId) == workerId;
+    }
+    function validOrg(orgId) {
+      return request.resource.data.organizationId == orgId;
+    }
+    function validSafetyTransition(from, to) {
+      return (from == 'submitted' && to == 'acknowledged') ||
+        (from == 'acknowledged' && to == 'in_progress') ||
+        (from == 'in_progress' && to == 'resolved') ||
+        (from == 'resolved' && to == 'reopened') ||
+        (from == 'reopened' && to == 'acknowledged');
+    }
+    function validGrievanceTransition(from, to) {
+      return (from == 'submitted' && to == 'under_review') ||
+        (from == 'under_review' && to == 'escalated') ||
+        (from == 'escalated' && to == 'resolved');
+    }
+    function eventPath(orgId, reportId, eventId) {
+      return /databases/$(database)/documents/organizations/$(orgId)/safetyReports/$(reportId)/events/$(eventId);
+    }
+    function reportPath(orgId, reportId) {
+      return /databases/$(database)/documents/organizations/$(orgId)/safetyReports/$(reportId);
+    }
+    function grievancePath(orgId, grievanceId) {
+      return /databases/$(database)/documents/organizations/$(orgId)/grievances/$(grievanceId);
+    }
+    function grievanceEventPath(orgId, grievanceId, eventId) {
+      return /databases/$(database)/documents/organizations/$(orgId)/grievances/$(grievanceId)/events/$(eventId);
+    }
+    function validEvent(eventData, status) {
+      return eventData.status == status && eventData.at == request.time &&
+        eventData.actorLabel is string && eventData.actorLabel.size() <= 100;
+    }
+
+    match /users/{uid}/memberships/{orgId} {
+      allow get, list: if signedIn() && request.auth.uid == uid;
+      // Memberships and role assignments are written only by trusted Admin SDK tooling.
+      allow create, update, delete: if false;
+    }
+
+    match /organizations/{orgId} {
+      allow get: if isMember(orgId);
+      allow list, create, update, delete: if false;
+
+      match /sites/{siteId} {
+        allow read: if isMember(orgId);
+        allow create, update: if isAdmin(orgId) && validOrg(orgId) && request.resource.data.name is string && request.resource.data.name.size() <= 120;
+        allow delete: if false;
+      }
+
+      match /workers/{workerId} {
+        allow read: if isManager(orgId) || ownsWorker(orgId, workerId);
+        allow create: if isAdmin(orgId) && validOrg(orgId) &&
+          request.resource.data.id == workerId && request.resource.data.role == 'worker' &&
+          request.resource.data.active is bool && request.resource.data.name is string &&
+          request.resource.data.jobTitle is string && request.resource.data.siteId is string &&
+          request.resource.data.createdAt == request.time &&
+          request.resource.data.keys().hasOnly(['id', 'organizationId', 'name', 'jobTitle', 'siteId', 'role', 'active', 'createdAt']) &&
+          exists(/databases/$(database)/documents/organizations/$(orgId)/sites/$(request.resource.data.siteId));
+        allow update: if isAdmin(orgId) && validOrg(orgId) &&
+          request.resource.data.role == resource.data.role && request.resource.data.id == resource.data.id &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'jobTitle', 'siteId', 'active', 'updatedAt']);
+        allow delete: if false;
+      }
+
+      match /workerCompensation/{workerId} {
+        allow read: if isAdmin(orgId) || ownsWorker(orgId, workerId);
+        allow create: if isAdmin(orgId) && validOrg(orgId) &&
+          request.resource.data.workerId == workerId && request.resource.data.hourlyRateMinor is int &&
+          request.resource.data.hourlyRateMinor >= 0 && request.resource.data.updatedAt == request.time &&
+          request.resource.data.keys().hasOnly(['organizationId', 'workerId', 'hourlyRateMinor', 'updatedAt']) &&
+          existsAfter(/databases/$(database)/documents/organizations/$(orgId)/workers/$(workerId));
+        allow update: if isAdmin(orgId) && validOrg(orgId) &&
+          request.resource.data.workerId == workerId &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['hourlyRateMinor', 'updatedAt']) &&
+          request.resource.data.hourlyRateMinor is int && request.resource.data.hourlyRateMinor >= 0 &&
+          request.resource.data.updatedAt == request.time;
+        allow delete: if false;
+      }
+
+      match /shifts/{shiftId} {
+        allow read: if isManager(orgId) || ownsWorker(orgId, resource.data.workerId);
+        allow create: if isManager(orgId) && validOrg(orgId) &&
+          request.resource.data.status == 'scheduled' && request.resource.data.workerId is string &&
+          request.resource.data.siteId is string &&
+          exists(/databases/$(database)/documents/organizations/$(orgId)/workers/$(request.resource.data.workerId)) &&
+          exists(/databases/$(database)/documents/organizations/$(orgId)/sites/$(request.resource.data.siteId)) &&
+          request.resource.data.startAt is string && request.resource.data.endAt is string &&
+          request.resource.data.endAt > request.resource.data.startAt &&
+          request.resource.data.title is string && request.resource.data.title.size() <= 80 &&
+          request.resource.data.createdAt == request.time;
+        allow update: if isManager(orgId) && validOrg(orgId) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['workerId', 'title', 'siteId', 'startAt', 'endAt', 'status', 'updatedAt']) &&
+          request.resource.data.workerId is string && request.resource.data.siteId is string &&
+          exists(/databases/$(database)/documents/organizations/$(orgId)/workers/$(request.resource.data.workerId)) &&
+          exists(/databases/$(database)/documents/organizations/$(orgId)/sites/$(request.resource.data.siteId)) &&
+          request.resource.data.endAt > request.resource.data.startAt &&
+          request.resource.data.status in ['scheduled', 'cancelled'] && request.resource.data.updatedAt == request.time &&
+          !exists(/databases/$(database)/documents/organizations/$(orgId)/attendance/$(shiftId));
+        allow delete: if false;
+      }
+
+      match /attendance/{shiftId} {
+        function shiftOwnedByMember(workerId) {
+          return exists(/databases/$(database)/documents/organizations/$(orgId)/shifts/$(shiftId)) &&
+            get(/databases/$(database)/documents/organizations/$(orgId)/shifts/$(shiftId)).data.workerId == workerId;
+        }
+        allow read: if isManager(orgId) || ownsWorker(orgId, resource.data.workerId);
+        allow create: if isMember(orgId) && validOrg(orgId) &&
+          request.resource.data.shiftId == shiftId && ownsWorker(orgId, request.resource.data.workerId) &&
+          shiftOwnedByMember(request.resource.data.workerId) && request.resource.data.checkInAt == request.time &&
+          request.resource.data.updatedAt == request.time && !('checkOutAt' in request.resource.data) &&
+          request.resource.data.keys().hasOnly(['organizationId', 'shiftId', 'workerId', 'checkInAt', 'updatedAt']);
+        allow update: if isMember(orgId) && resource.data.shiftId == shiftId &&
+          ownsWorker(orgId, resource.data.workerId) && shiftOwnedByMember(resource.data.workerId) &&
+          resource.data.checkInAt is timestamp && !('checkOutAt' in resource.data) &&
+          request.resource.data.checkOutAt == request.time && request.resource.data.updatedAt == request.time &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['checkOutAt', 'updatedAt']);
+        allow delete: if false;
+      }
+
+      match /payStatements/{statementId} {
+        allow read: if isAdmin(orgId) || ownsWorker(orgId, resource.data.workerId);
+        allow create: if isAdmin(orgId) && validOrg(orgId) &&
+          request.resource.data.workerId is string && request.resource.data.status == 'estimate' &&
+          request.resource.data.regularHours is number && request.resource.data.regularHours >= 0 &&
+          request.resource.data.overtimeHours is number && request.resource.data.overtimeHours >= 0 &&
+          request.resource.data.baseRateMinor is int && request.resource.data.baseRateMinor >= 0 &&
+          request.resource.data.grossMinor is int && request.resource.data.netMinor is int &&
+          request.resource.data.createdAt == request.time &&
+          exists(/databases/$(database)/documents/organizations/$(orgId)/workers/$(request.resource.data.workerId));
+        allow update: if isAdmin(orgId) && validOrg(orgId) &&
+          request.resource.data.workerId == resource.data.workerId &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']) &&
+          request.resource.data.status in ['estimate', 'approved', 'paid'];
+        allow delete: if false;
+      }
+
+      match /safetyReports/{reportId} {
+        allow read: if isManager(orgId) || (isMember(orgId) && resource.data.reporterUid == request.auth.uid);
+        allow create: if isMember(orgId) && validOrg(orgId) &&
+          request.resource.data.reporterUid == request.auth.uid &&
+          request.resource.data.reporterId == memberWorkerId(orgId) &&
+          request.resource.data.id == reportId &&
+          request.resource.data.status == 'submitted' &&
+          request.resource.data.severity in ['low', 'medium', 'high', 'critical'] &&
+          request.resource.data.category is string && request.resource.data.category.size() <= 60 &&
+          request.resource.data.description is string && request.resource.data.description.size() >= 12 && request.resource.data.description.size() <= 2000 &&
+          request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time &&
+          request.resource.data.keys().hasOnly(['id', 'organizationId', 'reporterUid', 'reporterId', 'siteId', 'category', 'description', 'severity', 'status', 'createdAt', 'updatedAt', 'lastEventId']) &&
+          exists(/databases/$(database)/documents/organizations/$(orgId)/sites/$(request.resource.data.siteId)) &&
+          existsAfter(eventPath(orgId, reportId, request.resource.data.lastEventId)) &&
+          validEvent(getAfter(eventPath(orgId, reportId, request.resource.data.lastEventId)).data, 'submitted');
+        allow update: if isManager(orgId) && validOrg(orgId) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt', 'lastEventId']) &&
+          request.resource.data.updatedAt == request.time &&
+          validSafetyTransition(resource.data.status, request.resource.data.status) &&
+          existsAfter(eventPath(orgId, reportId, request.resource.data.lastEventId)) &&
+          getAfter(eventPath(orgId, reportId, request.resource.data.lastEventId)).data.status == request.resource.data.status &&
+          getAfter(eventPath(orgId, reportId, request.resource.data.lastEventId)).data.at == request.time;
+        allow delete: if false;
+
+        match /events/{eventId} {
+          allow read: if isManager(orgId) || (isMember(orgId) && get(reportPath(orgId, reportId)).data.reporterUid == request.auth.uid);
+          allow create: if isMember(orgId) && request.resource.data.at == request.time &&
+            request.resource.data.status is string && request.resource.data.actorLabel is string &&
+            request.resource.data.actorLabel.size() <= 100 && request.resource.data.keys().hasOnly(['status', 'at', 'actorLabel', 'note']) &&
+            (( !exists(reportPath(orgId, reportId)) &&
+                getAfter(reportPath(orgId, reportId)).data.reporterUid == request.auth.uid &&
+                getAfter(reportPath(orgId, reportId)).data.status == 'submitted' &&
+                getAfter(reportPath(orgId, reportId)).data.createdAt == request.time &&
+                getAfter(reportPath(orgId, reportId)).data.lastEventId == eventId && request.resource.data.status == 'submitted') ||
+             (isManager(orgId) && exists(reportPath(orgId, reportId)) &&
+                getAfter(reportPath(orgId, reportId)).data.lastEventId == eventId &&
+                getAfter(reportPath(orgId, reportId)).data.updatedAt == request.time &&
+                getAfter(reportPath(orgId, reportId)).data.status == request.resource.data.status &&
+                get(reportPath(orgId, reportId)).data.status != request.resource.data.status));
+          allow update, delete: if false;
+        }
+      }
+
+      match /grievances/{grievanceId} {
+        allow read: if isManager(orgId) || (isMember(orgId) && resource.data.anonymous == false && resource.data.reporterUid == request.auth.uid);
+        allow create: if isMember(orgId) && validOrg(orgId) &&
+          request.resource.data.anonymous is bool && request.resource.data.status == 'submitted' &&
+          request.resource.data.id == grievanceId &&
+          request.resource.data.category is string && request.resource.data.category.size() <= 60 &&
+          request.resource.data.message is string && request.resource.data.message.size() >= 12 && request.resource.data.message.size() <= 2000 &&
+          request.resource.data.createdAt == request.time && request.resource.data.updatedAt == request.time &&
+          ((request.resource.data.anonymous == true && !('reporterUid' in request.resource.data) && !('reporterWorkerId' in request.resource.data)) ||
+           (request.resource.data.anonymous == false && request.resource.data.reporterUid == request.auth.uid && request.resource.data.reporterWorkerId == memberWorkerId(orgId))) &&
+          request.resource.data.keys().hasOnly(['id', 'organizationId', 'anonymous', 'category', 'message', 'status', 'createdAt', 'updatedAt', 'reporterUid', 'reporterWorkerId', 'lastEventId']) &&
+          existsAfter(grievanceEventPath(orgId, grievanceId, request.resource.data.lastEventId)) &&
+          validEvent(getAfter(grievanceEventPath(orgId, grievanceId, request.resource.data.lastEventId)).data, 'submitted');
+        allow update: if isManager(orgId) && validOrg(orgId) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt', 'lastEventId']) &&
+          request.resource.data.updatedAt == request.time &&
+          validGrievanceTransition(resource.data.status, request.resource.data.status) &&
+          existsAfter(grievanceEventPath(orgId, grievanceId, request.resource.data.lastEventId)) &&
+          getAfter(grievanceEventPath(orgId, grievanceId, request.resource.data.lastEventId)).data.status == request.resource.data.status &&
+          getAfter(grievanceEventPath(orgId, grievanceId, request.resource.data.lastEventId)).data.at == request.time;
+        allow delete: if false;
+
+        match /events/{eventId} {
+          allow read: if isManager(orgId) || (isMember(orgId) && get(grievancePath(orgId, grievanceId)).data.anonymous == false && get(grievancePath(orgId, grievanceId)).data.reporterUid == request.auth.uid);
+          allow create: if isMember(orgId) && request.resource.data.at == request.time &&
+            request.resource.data.status is string && request.resource.data.actorLabel is string &&
+            request.resource.data.actorLabel.size() <= 100 && request.resource.data.keys().hasOnly(['status', 'at', 'actorLabel']) &&
+            (( !exists(grievancePath(orgId, grievanceId)) &&
+                getAfter(grievancePath(orgId, grievanceId)).data.createdAt == request.time &&
+                getAfter(grievancePath(orgId, grievanceId)).data.lastEventId == eventId &&
+                getAfter(grievancePath(orgId, grievanceId)).data.status == 'submitted' && request.resource.data.status == 'submitted' &&
+                (getAfter(grievancePath(orgId, grievanceId)).data.anonymous == true || getAfter(grievancePath(orgId, grievanceId)).data.reporterUid == request.auth.uid)) ||
+             (isManager(orgId) && exists(grievancePath(orgId, grievanceId)) &&
+                getAfter(grievancePath(orgId, grievanceId)).data.lastEventId == eventId &&
+                getAfter(grievancePath(orgId, grievanceId)).data.updatedAt == request.time &&
+                getAfter(grievancePath(orgId, grievanceId)).data.status == request.resource.data.status &&
+                validGrievanceTransition(get(grievancePath(orgId, grievanceId)).data.status, request.resource.data.status)));
+          allow update, delete: if false;
+        }
+      }
+
+      match /skills/{skillId} {
+        allow read: if isManager(orgId) || ownsWorker(orgId, resource.data.workerId);
+        allow create: if isMember(orgId) && validOrg(orgId) &&
+          ownsWorker(orgId, request.resource.data.workerId) && request.resource.data.ownerUid == request.auth.uid &&
+          request.resource.data.verification == 'pending' &&
+          request.resource.data.name is string && request.resource.data.name.size() <= 100 &&
+          request.resource.data.issuer is string && request.resource.data.issuer.size() <= 100 &&
+          request.resource.data.type in ['skill', 'training', 'certification'] &&
+          request.resource.data.createdAt == request.time;
+        allow update: if isManager(orgId) && validOrg(orgId) &&
+          request.resource.data.workerId == resource.data.workerId &&
+          resource.data.verification in ['pending', 'unverified'] && request.resource.data.verification == 'verified' &&
+          request.resource.data.verifiedBy == request.auth.uid && request.resource.data.verifiedAt == request.time &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['verification', 'verifiedBy', 'verifiedAt']);
+        allow delete: if false;
+      }
+
+      match /auditEvents/{eventId} {
+        allow read: if isAdmin(orgId);
+        allow create, update, delete: if false;
+      }
+
+      match /{document=**} {
+        allow read, write: if false;
+      }
+    }
+  }
+}

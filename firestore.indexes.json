@@ -1,0 +1,12 @@
+{
+  "indexes": [
+    { "collectionGroup": "grievances", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "reporterUid", "order": "ASCENDING" }, { "fieldPath": "anonymous", "order": "ASCENDING" }] },
+    { "collectionGroup": "shifts", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "status", "order": "ASCENDING" }, { "fieldPath": "startAt", "order": "ASCENDING" }] },
+    { "collectionGroup": "attendance", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "workerId", "order": "ASCENDING" }, { "fieldPath": "checkInAt", "order": "DESCENDING" }] },
+    { "collectionGroup": "safetyReports", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "status", "order": "ASCENDING" }, { "fieldPath": "severity", "order": "ASCENDING" }, { "fieldPath": "createdAt", "order": "DESCENDING" }] },
+    { "collectionGroup": "grievances", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "status", "order": "ASCENDING" }, { "fieldPath": "createdAt", "order": "DESCENDING" }] },
+    { "collectionGroup": "payStatements", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "workerId", "order": "ASCENDING" }, { "fieldPath": "createdAt", "order": "DESCENDING" }] },
+    { "collectionGroup": "skills", "queryScope": "COLLECTION", "fields": [{ "fieldPath": "workerId", "order": "ASCENDING" }, { "fieldPath": "issuedOn", "order": "DESCENDING" }] }
+  ],
+  "fieldOverrides": []
+}
